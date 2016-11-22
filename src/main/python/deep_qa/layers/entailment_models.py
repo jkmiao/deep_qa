@@ -15,6 +15,7 @@ reasoning over this background knowledge, which the entailment model can choose 
 from typing import Any, Dict
 
 from keras import backend as K
+from keras import initializations, activations
 from keras.layers import Dense, Layer, TimeDistributed
 
 from ..common.tensors import switch, masked_softmax, tile_vector
@@ -219,6 +220,132 @@ class MultipleChoiceEntailmentModel:
         return softmax_output
 
 
+class DecomposableAttentionEntailment(Layer):
+    '''
+    This layer is a reimplementation of the entailment algorithm described in the following paper:
+    "A Decomposable Attention Model for Natural Language Inference", Parikh et al., 2016.
+    At this point this doesn't quite fit into the setup we have here because the model doesn't
+    operate on the encoded sentence representations, but instead consumes the word level representations.
+    TODO(pradeep): Make this work with the memory network eventually.
+    '''
+    def __init__(self, params: Dict[str, Any]):
+        self.num_hidden_layers = params.pop('num_hidden_layers', 1)
+        self.hidden_layer_width = params.pop('hidden_layer_width', 50)
+        self.hidden_layer_activation = params.pop('hidden_layer_activation', 'relu')
+        self.init = initializations.get(params.pop('init', 'uniform'))
+        self.supports_masking = True
+        super(DecomposableAttentionEntailment, self).__init__(**params)
+
+    def build(self, input_shape):
+        '''
+        This model has three feed forward NNs (F, G and H in the paper). We assume that all three NNs have the
+        share the same values for num_hidden_layers, hidden_layer_width and hidden_layer_activation. H has a
+        separate softmax layer at the end.
+        '''
+        super(DecomposableAttentionEntailment, self).build(input_shape)
+        # input_shape is a list containing the shapes of the two inputs.
+        # Both sentences should be of the same length to share compare weights.
+        assert input_shape[0][1] == input_shape[1][1]
+        sentence_length = input_shape[0][-2]
+        input_dim = input_shape[0][-1]
+        # pylint: disable=attribute-defined-outside-init
+        self.attend_weights = []  # weights related to F
+        self.compare_weights = []  # weights related to G
+        self.aggregate_weights = []  # weights related to H
+        attend_input_dim = input_dim
+        compare_input_dim = input_dim + sentence_length
+        aggregate_input_dim = self.hidden_layer_width * 2
+        for i in range(self.num_hidden_layers):
+            self.attend_weights.append(self.init((attend_input_dim, self.hidden_layer_width),
+                                                 name='%s_attend_%d' % (self.name, i)))
+            self.compare_weights.append(self.init((compare_input_dim, self.hidden_layer_width),
+                                                  name='%s_compare_%d' % (self.name, i)))
+            self.aggregate_weights.append(self.init((aggregate_input_dim, self.hidden_layer_width),
+                                                    name='%s_aggregate_%d' % (self.name, i)))
+            attend_input_dim = self.hidden_layer_width
+            compare_input_dim = self.hidden_layer_width
+            aggregate_input_dim = self.hidden_layer_width
+        self.trainable_weights = self.attend_weights + self.compare_weights + self.aggregate_weights
+        self.scorer = self.init((self.hidden_layer_width, 2), name='%s_score' % self.name)
+        self.trainable_weights.append(self.scorer)
+
+    def compute_mask(self, x, mask=None):
+        # pylint: disable=unused-argument
+        return None
+
+    def get_output_shape_for(self, input_shape):
+        return (input_shape[0][0], 2)  # returns T/F probabilities.
+
+    @staticmethod
+    def _apply_feed_forward(input_tensor, weights, activation):
+        current_tensor = input_tensor
+        for weight in weights:
+            current_tensor = activation(K.dot(current_tensor, weight))
+        return current_tensor
+
+    def call(self, x, mask=None):
+        # sentence_length_p = sentence_length_h in the following lines, but the names are kept separate to keep
+        # track of the axes being normalized.
+        premise_embedding, hypothesis_embedding = x
+        # (batch_size, sentence_length_p), (batch_size, sentence_length_h)
+        premise_mask, hypothesis_mask = mask
+        if premise_mask is not None:
+            premise_embedding = switch(K.expand_dims(premise_mask), premise_embedding,
+                                       K.zeros_like(premise_embedding))
+        if hypothesis_mask is not None:
+            hypothesis_embedding = switch(K.expand_dims(hypothesis_mask), hypothesis_embedding,
+                                          K.zeros_like(hypothesis_embedding))
+        activation = activations.get(self.hidden_layer_activation)
+        # (batch_size, sentence_length_p, hidden_dim)
+        projected_premise = self._apply_feed_forward(premise_embedding, self.attend_weights, activation)
+        # (batch_size, sentence_length_h, hidden_dim)
+        projected_hypothesis = self._apply_feed_forward(hypothesis_embedding, self.attend_weights, activation)
+        # (batch_size, sentence_length_p, sentence_length_h)
+        unnormalized_alignment = K.batch_dot(projected_premise, projected_hypothesis, axes=(2, 2))
+        (batch_size, premise_length, hypothesis_length) = K.shape(unnormalized_alignment)
+
+        ## Step 1: Attend
+        # (batch_size, sentence_length_h, sentence_length_p)
+        reshaped_alignment = K.permute_dimensions(unnormalized_alignment, (0, 2, 1))
+        flattened_unnormalized_alignment = K.batch_flatten(unnormalized_alignment)
+        flattened_reshaped_alignment = K.batch_flatten(reshaped_alignment)
+        if premise_mask is None and hypothesis_mask is None:
+            # (batch_size * sentence_length_p, sentence_length_h)
+            flattened_p2h_alignments = K.softmax(flattened_unnormalized_alignment)
+            # (batch_size * sentence_length_h, sentence_length_p)
+            flattened_h2p_alignments = K.softmax(flattened_reshaped_alignment)
+        else:
+            # We have to compute alignment masks. All those elements that correspond to a masked word in
+            # either the premise or the hypothesis need to be masked.
+            # (batch_size * sentence_length_p, sentence_length_h)
+            p2h_mask = K.batch_flatten(K.expand_dims(premise_mask, dim=-1) * K.expand_dims(hypothesis_mask, dim=1))
+            # (batch_size * sentence_length_h, sentence_length_p)
+            h2p_mask = K.batch_flatten(K.expand_dims(premise_mask, dim=1) * K.expand_dims(hypothesis_mask, dim=-1))
+            flattened_p2h_alignments = masked_softmax(flattened_unnormalized_alignment, p2h_mask)
+            flattened_h2p_alignments = masked_softmax(flattened_reshaped_alignment, h2p_mask)
+        # beta in the paper (equation 2), (batch_size, sentence_length_p, sentence_length_h)
+        p2h_alignments = K.reshape(flattened_p2h_alignments, (batch_size, premise_length, hypothesis_length))
+        # alpha in paper (equation 2), (batch_size, sentence_length_h, sentence_length_p)
+        h2p_alignments = K.reshape(flattened_h2p_alignments, (batch_size, hypothesis_length, premise_length))
+
+        ## Step 2: Compare
+        # Concatenate premise embedding and its alignments with hypothesis
+        premise_comparison_input = K.concatenate([premise_embedding, p2h_alignments])
+        hypothesis_comparison_input = K.concatenate([hypothesis_embedding, h2p_alignments])
+        compared_premise = self._apply_feed_forward(premise_comparison_input, self.compare_weights, activation)
+        compared_hypothesis = self._apply_feed_forward(hypothesis_comparison_input, self.compare_weights,
+                                                       activation)
+
+        ## Step 3: Aggregate
+        # (batch_size, hidden_dim * 2)
+        aggregated_input = K.concatenate([K.sum(compared_premise, axis=1), K.sum(compared_hypothesis, axis=1)])
+        # (batch_size, hidden_dim)
+        input_to_scorer = self._apply_feed_forward(aggregated_input, self.aggregate_weights, activation)
+        # (batch_size, 2)
+        scores = K.softmax(K.dot(input_to_scorer, self.scorer))
+        return scores
+
+
 def split_combiner_inputs(x, encoding_dim: int):  # pylint: disable=invalid-name
     sentence_encoding = x[:, :encoding_dim]
     current_memory = x[:, encoding_dim:2*encoding_dim]
@@ -283,6 +410,7 @@ entailment_models = {  # pylint: disable=invalid-name
         'true_false_mlp': TrueFalseEntailmentModel,
         'multiple_choice_mlp': MultipleChoiceEntailmentModel,
         'question_answer_mlp': QuestionAnswerEntailmentModel,
+        'decomposable_attention': DecomposableAttentionEntailment,
         }
 
 entailment_input_combiners = {  # pylint: disable=invalid-name
