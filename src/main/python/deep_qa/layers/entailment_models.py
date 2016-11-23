@@ -224,6 +224,17 @@ class DecomposableAttentionEntailment(Layer):
     '''
     This layer is a reimplementation of the entailment algorithm described in the following paper:
     "A Decomposable Attention Model for Natural Language Inference", Parikh et al., 2016.
+    The algorithm has three main steps:
+    1) Attend: Compute dot products between all pairs of projections of words in the hypothesis and the premise,
+        normalize those dot products to use them to align each word in premise to a phrase in the hypothesis and
+        vice-versa. These alignments are then used to summarize the aligned phrase in the other sentence as a
+        weighted sum. The initial word projections are computed using a feed forward NN, F.
+    2) Compare: Pass a concatenation of each word in the premise and the summary of its aligned phrase in the
+        hypothesis through a feed forward NN, G, to get a projected comparison. Do the same with the hypothesis
+        and the aligned phrase from the premise.
+    3) Aggregate: Sum over the comparisons to get a single vector each for premise-hypothesis comparison, and
+        hypothesis-premise comparison. Ass them through a third feef forward NN, H to get the entailment decision.
+
     At this point this doesn't quite fit into the setup we have here because the model doesn't
     operate on the encoded sentence representations, but instead consumes the word level representations.
     TODO(pradeep): Make this work with the memory network eventually.
@@ -239,7 +250,8 @@ class DecomposableAttentionEntailment(Layer):
     def build(self, input_shape):
         '''
         This model has three feed forward NNs (F, G and H in the paper). We assume that all three NNs have the
-        share the same values for num_hidden_layers, hidden_layer_width and hidden_layer_activation. H has a
+        same hyper-parameters: num_hidden_layers, hidden_layer_width and hidden_layer_activation. That is, 
+        F, G and H have the same structure and activations. Their actual weights are different, though. H has a
         separate softmax layer at the end.
         '''
         super(DecomposableAttentionEntailment, self).build(input_shape)
@@ -253,7 +265,7 @@ class DecomposableAttentionEntailment(Layer):
         self.compare_weights = []  # weights related to G
         self.aggregate_weights = []  # weights related to H
         attend_input_dim = input_dim
-        compare_input_dim = input_dim + sentence_length
+        compare_input_dim = 2 * input_dim
         aggregate_input_dim = self.hidden_layer_width * 2
         for i in range(self.num_hidden_layers):
             self.attend_weights.append(self.init((attend_input_dim, self.hidden_layer_width),
@@ -274,6 +286,7 @@ class DecomposableAttentionEntailment(Layer):
         return None
 
     def get_output_shape_for(self, input_shape):
+        # (batch_size, 2)
         return (input_shape[0][0], 2)  # returns T/F probabilities.
 
     @staticmethod
@@ -284,10 +297,10 @@ class DecomposableAttentionEntailment(Layer):
         return current_tensor
 
     def call(self, x, mask=None):
-        # sentence_length_p = sentence_length_h in the following lines, but the names are kept separate to keep
+        # premise_length = hypothesis_length in the following lines, but the names are kept separate to keep
         # track of the axes being normalized.
         premise_embedding, hypothesis_embedding = x
-        # (batch_size, sentence_length_p), (batch_size, sentence_length_h)
+        # (batch_size, premise_length), (batch_size, hypothesis_length)
         premise_mask, hypothesis_mask = mask
         if premise_mask is not None:
             premise_embedding = switch(K.expand_dims(premise_mask), premise_embedding,
@@ -296,47 +309,57 @@ class DecomposableAttentionEntailment(Layer):
             hypothesis_embedding = switch(K.expand_dims(hypothesis_mask), hypothesis_embedding,
                                           K.zeros_like(hypothesis_embedding))
         activation = activations.get(self.hidden_layer_activation)
-        # (batch_size, sentence_length_p, hidden_dim)
+        # (batch_size, premise_length, hidden_dim)
         projected_premise = self._apply_feed_forward(premise_embedding, self.attend_weights, activation)
-        # (batch_size, sentence_length_h, hidden_dim)
+        # (batch_size, hypothesis_length, hidden_dim)
         projected_hypothesis = self._apply_feed_forward(hypothesis_embedding, self.attend_weights, activation)
-        # (batch_size, sentence_length_p, sentence_length_h)
-        unnormalized_alignment = K.batch_dot(projected_premise, projected_hypothesis, axes=(2, 2))
-        (batch_size, premise_length, hypothesis_length) = K.shape(unnormalized_alignment)
+        # (batch_size, premise_length, hypothesis_length)
+        unnormalized_attention = K.batch_dot(projected_premise, projected_hypothesis, axes=(2, 2))
+        (batch_size, premise_length, hypothesis_length) = K.shape(unnormalized_attention)
 
         ## Step 1: Attend
-        # (batch_size, sentence_length_h, sentence_length_p)
-        reshaped_alignment = K.permute_dimensions(unnormalized_alignment, (0, 2, 1))
-        flattened_unnormalized_alignment = K.batch_flatten(unnormalized_alignment)
-        flattened_reshaped_alignment = K.batch_flatten(reshaped_alignment)
+        # (batch_size, hypothesis_length, premise_length)
+        reshaped_attention = K.permute_dimensions(unnormalized_attention, (0, 2, 1))
+        flattened_unnormalized_attention = K.batch_flatten(unnormalized_attention)
+        flattened_reshaped_attention = K.batch_flatten(reshaped_attention)
         if premise_mask is None and hypothesis_mask is None:
-            # (batch_size * sentence_length_p, sentence_length_h)
-            flattened_p2h_alignments = K.softmax(flattened_unnormalized_alignment)
-            # (batch_size * sentence_length_h, sentence_length_p)
-            flattened_h2p_alignments = K.softmax(flattened_reshaped_alignment)
+            # (batch_size * premise_length, hypothesis_length)
+            flattened_p2h_attention = K.softmax(flattened_unnormalized_attention)
+            # (batch_size * hypothesis_length, premise_length)
+            flattened_h2p_attention = K.softmax(flattened_reshaped_attention)
         else:
             # We have to compute alignment masks. All those elements that correspond to a masked word in
             # either the premise or the hypothesis need to be masked.
-            # (batch_size * sentence_length_p, sentence_length_h)
+            # (batch_size * premise_length, hypothesis_length)
             p2h_mask = K.batch_flatten(K.expand_dims(premise_mask, dim=-1) * K.expand_dims(hypothesis_mask, dim=1))
-            # (batch_size * sentence_length_h, sentence_length_p)
+            # (batch_size * hypothesis_length, premise_length)
             h2p_mask = K.batch_flatten(K.expand_dims(premise_mask, dim=1) * K.expand_dims(hypothesis_mask, dim=-1))
-            flattened_p2h_alignments = masked_softmax(flattened_unnormalized_alignment, p2h_mask)
-            flattened_h2p_alignments = masked_softmax(flattened_reshaped_alignment, h2p_mask)
-        # beta in the paper (equation 2), (batch_size, sentence_length_p, sentence_length_h)
-        p2h_alignments = K.reshape(flattened_p2h_alignments, (batch_size, premise_length, hypothesis_length))
-        # alpha in paper (equation 2), (batch_size, sentence_length_h, sentence_length_p)
-        h2p_alignments = K.reshape(flattened_h2p_alignments, (batch_size, hypothesis_length, premise_length))
+            flattened_p2h_attention = masked_softmax(flattened_unnormalized_attention, p2h_mask)
+            flattened_h2p_attention = masked_softmax(flattened_reshaped_attention, h2p_mask)
+        # (batch_size, premise_length, hypothesis_length)
+        p2h_attention = K.reshape(flattened_p2h_attention, (batch_size, premise_length, hypothesis_length))
+        # (batch_size, hypothesis_length, premise_length)
+        h2p_attention = K.reshape(flattened_h2p_attention, (batch_size, hypothesis_length, premise_length))
+        # beta in the paper (equation 2)
+        # sum((batch_size, premise_length, hyp_length, embed_dim), axis=2) = (batch_size, premise_length, emb_dim)
+        p2h_alignments = K.sum(K.expand_dims(p2h_attention, dim=-1) * K.expand_dims(hypothesis_embedding, dim=1),
+                               axis=2)
+        # alpha in the paper (equation 2)
+        # sum((batch_size, hyp_length, premise_length, embed_dim), axis=2) = (batch_size, hyp_length, emb_dim)
+        h2p_alignments = K.sum(K.expand_dims(h2p_attention, dim=-1) * K.expand_dims(premise_embedding, dim=1),
+                               axis=2)
 
         ## Step 2: Compare
         # Concatenate premise embedding and its alignments with hypothesis
         premise_comparison_input = K.concatenate([premise_embedding, p2h_alignments])
         hypothesis_comparison_input = K.concatenate([hypothesis_embedding, h2p_alignments])
+        # Equation 3 in the paper.
         compared_premise = self._apply_feed_forward(premise_comparison_input, self.compare_weights, activation)
         compared_hypothesis = self._apply_feed_forward(hypothesis_comparison_input, self.compare_weights,
                                                        activation)
 
         ## Step 3: Aggregate
+        # Equations 4 and 5.
         # (batch_size, hidden_dim * 2)
         aggregated_input = K.concatenate([K.sum(compared_premise, axis=1), K.sum(compared_hypothesis, axis=1)])
         # (batch_size, hidden_dim)
