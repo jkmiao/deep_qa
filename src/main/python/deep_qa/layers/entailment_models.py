@@ -250,7 +250,7 @@ class DecomposableAttentionEntailment(Layer):
     def build(self, input_shape):
         '''
         This model has three feed forward NNs (F, G and H in the paper). We assume that all three NNs have the
-        same hyper-parameters: num_hidden_layers, hidden_layer_width and hidden_layer_activation. That is, 
+        same hyper-parameters: num_hidden_layers, hidden_layer_width and hidden_layer_activation. That is,
         F, G and H have the same structure and activations. Their actual weights are different, though. H has a
         separate softmax layer at the end.
         '''
@@ -258,7 +258,6 @@ class DecomposableAttentionEntailment(Layer):
         # input_shape is a list containing the shapes of the two inputs.
         # Both sentences should be of the same length to share compare weights.
         assert input_shape[0][1] == input_shape[1][1]
-        sentence_length = input_shape[0][-2]
         input_dim = input_shape[0][-1]
         # pylint: disable=attribute-defined-outside-init
         self.attend_weights = []  # weights related to F
