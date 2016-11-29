@@ -1,4 +1,4 @@
-from typing import Any, Dict
+from typing import Any, Dict, List
 from overrides import overrides
 
 from keras.layers import Input
@@ -6,6 +6,9 @@ from keras.engine import Layer
 
 from .memory_network import MemoryNetworkSolver
 from ...training.models import DeepQaModel
+from ...data.dataset import TextDataset
+from ...data.instances.snli_instance import SnliInstance
+from ...data.instances.true_false_instance import TrueFalseInstance
 
 
 #TODO(pradeep): Properly merge this with memory networks.
@@ -19,17 +22,43 @@ class DecomposableAttentionSolver(MemoryNetworkSolver):
     preparation and embedding steps from that class that are reused here.
     '''
     def __init__(self, params: Dict[str, Any]):
+        self.data_type = params.pop('data_type', 'science_qa')  # science_qa or snli?
         super(DecomposableAttentionSolver, self).__init__(params)
         # This solver works only with decomposable_attention. Overwriting entailment_choices
         self.entailment_choices = ['decomposable_attention']
 
     @overrides
+    def _instance_type(self):
+        if self.data_type == "snli":
+            return SnliInstance
+        else:
+            return TrueFalseInstance
+
+    @overrides
+    def _load_dataset_from_files(self, files: List[str]):
+        if self.data_type == "snli":
+            return TextDataset.read_from_file(files[0], self._instance_type(), tokenizer=self.tokenizer)
+        else:
+            return super(DecomposableAttentionSolver, self)._load_dataset_from_files(files)
+
+    @overrides
+    def _set_max_lengths(self, max_lengths: Dict[str, int]):
+        if self.data_type == "snli":
+            self.max_sentence_length = max_lengths['word_sequence_length']
+        else:
+            super(DecomposableAttentionSolver, self)._set_max_lengths(max_lengths)
+
+    @overrides
     def _build_model(self):
         question_input = Input(shape=self._get_question_shape(), dtype='int32', name="sentence_input")
-        knowledge_input = Input(shape=self._get_background_shape(), dtype='int32', name="background_input")
+        if self.data_type == "snli":
+            knowledge_input = Input(shape=self._get_question_shape(), dtype='int32', name="background_input")
+        else:
+            knowledge_input = Input(shape=self._get_background_shape(), dtype='int32', name="background_input")
         question_embedding = self._embed_input(question_input)
         knowledge_embedding = self._embed_input(knowledge_input)
-        knowledge_embedding = TopKnowledgeSelector()(knowledge_embedding)
+        if not self.data_type == "snli":
+            knowledge_embedding = TopKnowledgeSelector()(knowledge_embedding)
 
         entailment_layer = self._get_entailment_model()
         true_false_probabilities = entailment_layer([knowledge_embedding, question_embedding])

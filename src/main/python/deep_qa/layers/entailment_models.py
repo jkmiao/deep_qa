@@ -246,6 +246,7 @@ class DecomposableAttentionEntailment(Layer):
         self.hidden_layer_width = params.pop('hidden_layer_width', 50)
         self.hidden_layer_activation = params.pop('hidden_layer_activation', 'relu')
         self.init = initializations.get(params.pop('init', 'uniform'))
+        self.num_classes = params.pop('num_classes', 2)
         self.supports_masking = True
         # Making the name end with 'softmax' to let debug handle this layer's output correctly.
         params['name'] = 'decomposable_attention_softmax'
@@ -284,7 +285,7 @@ class DecomposableAttentionEntailment(Layer):
             compare_input_dim = self.hidden_layer_width
             aggregate_input_dim = self.hidden_layer_width
         self.trainable_weights = self.attend_weights + self.compare_weights + self.aggregate_weights
-        self.scorer = self.init((self.hidden_layer_width, 2), name='%s_score' % self.name)
+        self.scorer = self.init((self.hidden_layer_width, self.num_classes), name='%s_score' % self.name)
         self.trainable_weights.append(self.scorer)
 
     def compute_mask(self, x, mask=None):
@@ -292,8 +293,8 @@ class DecomposableAttentionEntailment(Layer):
         return None
 
     def get_output_shape_for(self, input_shape):
-        # (batch_size, 2)
-        return (input_shape[0][0], 2)  # returns T/F probabilities.
+        # (batch_size, num_classes)
+        return (input_shape[0][0], self.num_classes)  # returns T/F probabilities.
 
     @staticmethod
     def _apply_feed_forward(input_tensor, weights, activation):
