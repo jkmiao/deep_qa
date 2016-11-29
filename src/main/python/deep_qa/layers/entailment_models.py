@@ -233,7 +233,8 @@ class DecomposableAttentionEntailment(Layer):
         hypothesis through a feed forward NN, G, to get a projected comparison. Do the same with the hypothesis
         and the aligned phrase from the premise.
     3) Aggregate: Sum over the comparisons to get a single vector each for premise-hypothesis comparison, and
-        hypothesis-premise comparison. Pass them through a third feed forward NN, H, to get the entailment decision.
+        hypothesis-premise comparison. Pass them through a third feed forward NN (H), to get the entailment
+        decision.
 
     At this point this doesn't quite fit into the memory network setup because the model doesn't
     operate on the encoded sentence representations, but instead consumes the word level representations.
