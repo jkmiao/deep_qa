@@ -233,11 +233,12 @@ class DecomposableAttentionEntailment(Layer):
         hypothesis through a feed forward NN, G, to get a projected comparison. Do the same with the hypothesis
         and the aligned phrase from the premise.
     3) Aggregate: Sum over the comparisons to get a single vector each for premise-hypothesis comparison, and
-        hypothesis-premise comparison. Ass them through a third feef forward NN, H to get the entailment decision.
+        hypothesis-premise comparison. Pass them through a third feed forward NN, H, to get the entailment decision.
 
-    At this point this doesn't quite fit into the setup we have here because the model doesn't
+    At this point this doesn't quite fit into the memory network setup because the model doesn't
     operate on the encoded sentence representations, but instead consumes the word level representations.
     TODO(pradeep): Make this work with the memory network eventually.
+    TODO(pradeep): Split this layer into multiple layers to make parts of it reusable with memory network.
     '''
     def __init__(self, params: Dict[str, Any]):
         self.num_hidden_layers = params.pop('num_hidden_layers', 1)
@@ -245,6 +246,13 @@ class DecomposableAttentionEntailment(Layer):
         self.hidden_layer_activation = params.pop('hidden_layer_activation', 'relu')
         self.init = initializations.get(params.pop('init', 'uniform'))
         self.supports_masking = True
+        # Making the name end with 'softmax' to let debug handle this layer's output correctly.
+        params['name'] = 'decomposable_attention_softmax'
+        # Weights will be initialized in the build method.
+        self.attend_weights = []  # weights related to F
+        self.compare_weights = []  # weights related to G
+        self.aggregate_weights = []  # weights related to H
+        self.scorer = None
         super(DecomposableAttentionEntailment, self).__init__(**params)
 
     def build(self, input_shape):
@@ -258,11 +266,9 @@ class DecomposableAttentionEntailment(Layer):
         # input_shape is a list containing the shapes of the two inputs.
         # Both sentences should be of the same length to share compare weights.
         assert input_shape[0][1] == input_shape[1][1]
+        # input_dim below is embedding dim for the model in the paper since they feed embedded input directly into
+        # this layer.
         input_dim = input_shape[0][-1]
-        # pylint: disable=attribute-defined-outside-init
-        self.attend_weights = []  # weights related to F
-        self.compare_weights = []  # weights related to G
-        self.aggregate_weights = []  # weights related to H
         attend_input_dim = input_dim
         compare_input_dim = 2 * input_dim
         aggregate_input_dim = self.hidden_layer_width * 2
@@ -295,6 +301,16 @@ class DecomposableAttentionEntailment(Layer):
             current_tensor = activation(K.dot(current_tensor, weight))
         return current_tensor
 
+    @staticmethod
+    def _last_dim_flatten(input_tensor):
+        '''
+        Takes a tensor and returns a matrix while preserving only the last dimension from the input.
+        '''
+        input_shape = K.shape(input_tensor)
+        last_dim = input_shape[-1]
+        size_till_last_dim = K.prod(input_shape[:-1])
+        return K.reshape(input_tensor, (size_till_last_dim, last_dim))
+
     def call(self, x, mask=None):
         # premise_length = hypothesis_length in the following lines, but the names are kept separate to keep
         # track of the axes being normalized.
@@ -319,22 +335,30 @@ class DecomposableAttentionEntailment(Layer):
         ## Step 1: Attend
         # (batch_size, hypothesis_length, premise_length)
         reshaped_attention = K.permute_dimensions(unnormalized_attention, (0, 2, 1))
-        flattened_unnormalized_attention = K.batch_flatten(unnormalized_attention)
-        flattened_reshaped_attention = K.batch_flatten(reshaped_attention)
+        flattened_unnormalized_attention = self._last_dim_flatten(unnormalized_attention)
+        flattened_reshaped_attention = self._last_dim_flatten(reshaped_attention)
         if premise_mask is None and hypothesis_mask is None:
             # (batch_size * premise_length, hypothesis_length)
             flattened_p2h_attention = K.softmax(flattened_unnormalized_attention)
             # (batch_size * hypothesis_length, premise_length)
             flattened_h2p_attention = K.softmax(flattened_reshaped_attention)
-        else:
+        elif premise_mask is not None and hypothesis_mask is not None:
             # We have to compute alignment masks. All those elements that correspond to a masked word in
             # either the premise or the hypothesis need to be masked.
+            # The two * operations below are essentially performing batched outer products. That is, the
+            # element-wise multiplications are between inputs of shape (batch_size, 1, l_a) and (batch_size, l_b, 1)
+            # to get an output of shape (batch_size, l_b, l_a).
             # (batch_size * premise_length, hypothesis_length)
-            p2h_mask = K.batch_flatten(K.expand_dims(premise_mask, dim=-1) * K.expand_dims(hypothesis_mask, dim=1))
+            p2h_mask = self._last_dim_flatten(K.expand_dims(premise_mask, dim=-1) * K.expand_dims(hypothesis_mask,
+                                                                                                  dim=1))
             # (batch_size * hypothesis_length, premise_length)
-            h2p_mask = K.batch_flatten(K.expand_dims(premise_mask, dim=1) * K.expand_dims(hypothesis_mask, dim=-1))
+            h2p_mask = self._last_dim_flatten(K.expand_dims(premise_mask, dim=1) * K.expand_dims(hypothesis_mask,
+                                                                                                 dim=-1))
             flattened_p2h_attention = masked_softmax(flattened_unnormalized_attention, p2h_mask)
             flattened_h2p_attention = masked_softmax(flattened_reshaped_attention, h2p_mask)
+        else:
+            # One of the two inputs is masked, and the other isn't. How did this happen??
+            raise NotImplementedError('Cannot handle only one of the inputs being masked.')
         # (batch_size, premise_length, hypothesis_length)
         p2h_attention = K.reshape(flattened_p2h_attention, (batch_size, premise_length, hypothesis_length))
         # (batch_size, hypothesis_length, premise_length)
